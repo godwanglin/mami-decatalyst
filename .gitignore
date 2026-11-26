@@ -5,4 +5,4 @@ dist-ssr
 .claude
 .DS_Store
 *.log
-
+.env

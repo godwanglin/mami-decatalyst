@@ -34,6 +34,57 @@ import {
   getBahanIcon,
   getMenuIcon
 } from './lib/icons';
+import LoginScreen from './components/auth/LoginScreen';
+import RegisterScreen from './components/auth/RegisterScreen';
+import AuthHeaderAction from './components/auth/AuthHeaderAction';
+import MealPlannerScreen from './components/planner/MealPlannerScreen';
+import { CalendarDays } from 'lucide-react';
+import { useAuth } from './context/AuthContext';
+import {
+  normalizeDetailToPlannerItem,
+  getSavedMealPlanSlotCount,
+} from './services/mealPlannerService';
+
+const VALID_STEPS = new Set([
+  'welcome',
+  'home',
+  'pilih-bahan',
+  'hasil',
+  'detail',
+  'selesai',
+  'meal-planner',
+  'login',
+  'register',
+]);
+
+const PROTECTED_STEPS = new Set([
+  'home',
+  'pilih-bahan',
+  'hasil',
+  'detail',
+  'selesai',
+  'meal-planner',
+]);
+
+const DETAIL_SESSION_KEY = 'mami_selected_detail_v1';
+
+function getStepFromHash() {
+  if (typeof window === 'undefined') return 'welcome';
+  const raw = window.location.hash.replace(/^#\/?/, '').trim();
+  return VALID_STEPS.has(raw) ? raw : 'welcome';
+}
+
+function syncUrlHash(nextStep, replace = false) {
+  if (typeof window === 'undefined') return;
+  const targetHash = `#${nextStep}`;
+  if (window.location.hash === targetHash) return;
+  const nextUrl = `${window.location.pathname}${window.location.search}${targetHash}`;
+  if (replace) {
+    window.history.replaceState({ step: nextStep }, '', nextUrl);
+  } else {
+    window.history.pushState({ step: nextStep }, '', nextUrl);
+  }
+}
 
 const bahanMap = Object.fromEntries(bahanData.map((b) => [b.id, b]));
 
@@ -116,7 +167,7 @@ function loadPersistedSelectedBahan() {
     if (raw) {
       const arr = JSON.parse(raw);
       if (Array.isArray(arr) && arr.length > 0) {
-        return new Set(arr.filter((id) => Boolean(bahanMap[id])));
+        return new Set(arr.filter((id) => typeof id === 'string' && Object.hasOwn(bahanMap, id)));
       }
     }
   } catch {
@@ -135,8 +186,8 @@ function loadPersistedChosenMeals() {
       .map((entry) => {
         if (!entry || !entry.id || !entry.type) return null;
         if (entry.type === 'menu') {
+          if (typeof entry.id !== 'string' || !Object.hasOwn(menuMap, entry.id)) return null;
           const fresh = menuMap[entry.id];
-          if (!fresh) return null;
           return {
             uid: `menu:${fresh.id}`,
             type: 'menu',
@@ -149,8 +200,8 @@ function loadPersistedChosenMeals() {
           };
         }
         if (entry.type === 'resep') {
+          if (typeof entry.id !== 'string' || !Object.hasOwn(resepMap, entry.id)) return null;
           const fresh = resepMap[entry.id];
-          if (!fresh) return null;
           let totalHarga = 0;
           let totalKalori = 0;
           for (const b of fresh.bahan || []) {
@@ -446,9 +497,99 @@ function MamiIdleMascot({ activeIndex, className = '' }) {
 }
 
 export default function App() {
-  // Navigation: 'welcome' | 'home' | 'pilih-bahan' | 'hasil' | 'detail' | 'selesai'
-  const [step, setStep] = useState('welcome');
+  // Navigation: 'welcome' | 'home' | 'pilih-bahan' | 'hasil' | 'detail' | 'selesai' | 'login' | 'register' | 'meal-planner'
+  const { user, loading: authLoading, isConfigured: isAuthConfigured } = useAuth();
+  const [step, setStep] = useState(getStepFromHash);
   const [direction, setDirection] = useState('forward'); // 'forward' | 'backward'
+  const [authReturnStep, setAuthReturnStep] = useState('welcome');
+  const [postLoginStep, setPostLoginStep] = useState('home');
+  const [authNotice, setAuthNotice] = useState('');
+  const [plannerReturnStep, setPlannerReturnStep] = useState('home');
+  const [plannerPendingItem, setPlannerPendingItem] = useState(null);
+  const hadUserRef = useRef(false);
+
+  const hasOperationalAccess = Boolean(user) || !isAuthConfigured;
+  const plannerStorageId = user?.uid || (!isAuthConfigured ? 'guest' : '');
+
+  const savedPlannerSlots = useMemo(
+    () => getSavedMealPlanSlotCount(plannerStorageId),
+    [plannerStorageId, step]
+  );
+
+  useEffect(() => {
+    syncUrlHash(step, true);
+  }, []);
+
+  useEffect(() => {
+    if (step !== 'meal-planner' && plannerPendingItem) {
+      setPlannerPendingItem(null);
+    }
+  }, [step, plannerPendingItem]);
+
+  useEffect(() => {
+    if (user) {
+      hadUserRef.current = true;
+      if (!authLoading && (step === 'login' || step === 'register')) {
+        const target = postLoginStep || 'home';
+        setAuthNotice('');
+        setPostLoginStep('home');
+        setDirection('forward');
+        setStep(target);
+        syncUrlHash(target, true);
+      }
+      return;
+    }
+    if (!isAuthConfigured || authLoading) return;
+    const wasLoggedIn = hadUserRef.current;
+    hadUserRef.current = false;
+    if (PROTECTED_STEPS.has(step)) {
+      setPlannerPendingItem(null);
+      if (wasLoggedIn) {
+        setAuthNotice('');
+        setDirection('backward');
+        setStep('welcome');
+        syncUrlHash('welcome', true);
+      } else {
+        setPostLoginStep(step);
+        setAuthReturnStep('welcome');
+        setAuthNotice('Masuk dulu yuk untuk mulai merencanakan makan bersama MAMI!');
+        setDirection('forward');
+        setStep('login');
+        syncUrlHash('login', true);
+      }
+    }
+  }, [authLoading, isAuthConfigured, user, step, postLoginStep]);
+
+  useEffect(() => {
+    const handleBrowserNav = () => {
+      const hashStep = getStepFromHash();
+      if ((hashStep === 'login' || hashStep === 'register') && !authLoading && user) {
+        setAuthNotice('');
+        setDirection('forward');
+        setStep('home');
+        syncUrlHash('home', true);
+        return;
+      }
+      if (isAuthConfigured && PROTECTED_STEPS.has(hashStep) && !authLoading && !user) {
+        setPostLoginStep(hashStep);
+        setAuthReturnStep('welcome');
+        setAuthNotice('Masuk dulu yuk untuk mulai merencanakan makan bersama MAMI!');
+        setDirection('forward');
+        setStep('login');
+        syncUrlHash('login', true);
+        return;
+      }
+      setDirection('backward');
+      setStep(hashStep);
+    };
+
+    window.addEventListener('popstate', handleBrowserNav);
+    window.addEventListener('hashchange', handleBrowserNav);
+    return () => {
+      window.removeEventListener('popstate', handleBrowserNav);
+      window.removeEventListener('hashchange', handleBrowserNav);
+    };
+  }, [authLoading, isAuthConfigured, user]);
 
   // Random Mascot Idle switcher (min 3 seconds, max 10 seconds)
   const [mascotIdleIdx, setMascotIdleIdx] = useState(0);
@@ -581,10 +722,99 @@ export default function App() {
   };
 
   // Detail screen state & Chosen daily meals for NutriMeter with localStorage persistence
-  const [selectedDetail, setSelectedDetail] = useState(null); // { type: 'resep' | 'menu', data: object }
-  const [detailPrevStep, setDetailPrevStep] = useState('hasil');
+  const [initialDetailState] = useState(() => {
+    try {
+      const raw = window.sessionStorage.getItem(DETAIL_SESSION_KEY);
+      if (!raw) return { detail: null, fromStep: 'hasil' };
+      const parsed = JSON.parse(raw);
+      const fromStep = VALID_STEPS.has(parsed?.fromStep) ? parsed.fromStep : 'hasil';
+      if (parsed?.type === 'menu' && typeof parsed.id === 'string' && Object.hasOwn(menuMap, parsed.id)) {
+        return { detail: { type: 'menu', data: menuMap[parsed.id] }, fromStep };
+      }
+      if (parsed?.type === 'resep' && typeof parsed.id === 'string' && Object.hasOwn(resepMap, parsed.id)) {
+        const fresh = resepMap[parsed.id];
+        let totalHarga = 0;
+        let totalKalori = 0;
+        let semuaBahanAda = true;
+        let kurangCount = 0;
+        const bahanList = [];
+        for (const item of fresh.bahan || []) {
+          const dipunyai = selectedBahan.has(item.id);
+          const ref = bahanMap[item.id];
+          if (!dipunyai) {
+            semuaBahanAda = false;
+            kurangCount += 1;
+          }
+          if (ref) {
+            totalHarga += ref.harga * (item.jumlah || 1);
+            totalKalori += ref.kalori * (item.jumlah || 1);
+            bahanList.push({
+              id: item.id,
+              nama: ref.nama,
+              satuan: ref.satuan,
+              jumlah: item.jumlah,
+              kategori: ref.kategori,
+              ada: dipunyai,
+            });
+          }
+        }
+        return {
+          detail: {
+            type: 'resep',
+            data: {
+              ...fresh,
+              waktu: fresh.waktu || parseInt(fresh.waktuMasak, 10) || 15,
+              totalHarga,
+              totalKalori,
+              bisaDimasak: semuaBahanAda,
+              kurangCount,
+              bahanList,
+            },
+          },
+          fromStep,
+        };
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return { detail: null, fromStep: 'hasil' };
+  });
+  const [selectedDetail, setSelectedDetail] = useState(initialDetailState.detail); // { type: 'resep' | 'menu', data: object }
+  const [detailPrevStep, setDetailPrevStep] = useState(initialDetailState.fromStep);
   const [chosenMeals, setChosenMeals] = useState(loadPersistedChosenMeals); // Array<{ uid, type, id, nama, gambar, harga, kalori, bahanIds }>
   const [selesaiPrevStep, setSelesaiPrevStep] = useState('hasil');
+
+  useEffect(() => {
+    try {
+      if (selectedDetail?.data?.id && selectedDetail?.type) {
+        window.sessionStorage.setItem(
+          DETAIL_SESSION_KEY,
+          JSON.stringify({
+            type: selectedDetail.type,
+            id: selectedDetail.data.id,
+            fromStep: detailPrevStep,
+          })
+        );
+      } else {
+        window.sessionStorage.removeItem(DETAIL_SESSION_KEY);
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }, [selectedDetail, detailPrevStep]);
+
+  useEffect(() => {
+    if (authLoading || !hasOperationalAccess) return;
+    if (step === 'detail' && !selectedDetail) {
+      setDirection('backward');
+      setStep('home');
+      syncUrlHash('home', true);
+    } else if (step === 'selesai' && chosenMeals.length === 0) {
+      setDirection('backward');
+      setStep('home');
+      syncUrlHash('home', true);
+    }
+  }, [authLoading, hasOperationalAccess, step, selectedDetail, chosenMeals.length]);
 
   useEffect(() => {
     try {
@@ -645,9 +875,7 @@ export default function App() {
   const [resultSearch, setResultSearch] = useState('');
 
   // Navigation handlers
-  const goTo = (nextStep, dir = 'forward') => {
-    setDirection(dir);
-    setStep(nextStep);
+  const scrollToTop = () => {
     if (typeof window !== 'undefined') {
       window.scrollTo(0, 0);
     }
@@ -655,6 +883,66 @@ export default function App() {
     if (screenEl) {
       screenEl.scrollTop = 0;
     }
+  };
+
+  const goTo = (nextStep, dir = 'forward') => {
+    if (isAuthConfigured && PROTECTED_STEPS.has(nextStep) && !user) {
+      setPostLoginStep(nextStep);
+      if (step !== 'login' && step !== 'register') {
+        setAuthReturnStep(step);
+      }
+      setAuthNotice('Masuk dulu yuk untuk mulai merencanakan makan bersama MAMI!');
+      setDirection('forward');
+      setStep('login');
+      syncUrlHash('login', false);
+      scrollToTop();
+      return;
+    }
+
+    if ((nextStep === 'login' || nextStep === 'register') && user) {
+      setAuthNotice('');
+      setDirection('forward');
+      setStep('home');
+      syncUrlHash('home', true);
+      scrollToTop();
+      return;
+    }
+
+    const isAuthSwitch =
+      (step === 'login' && nextStep === 'register') ||
+      (step === 'register' && nextStep === 'login');
+
+    if ((nextStep === 'login' || nextStep === 'register') && !isAuthSwitch) {
+      setAuthReturnStep(step);
+      setPostLoginStep('home');
+      setAuthNotice('');
+    }
+
+    if (nextStep === 'meal-planner' && step !== 'meal-planner') {
+      setPlannerReturnStep(step);
+    }
+
+    setDirection(dir);
+    setStep(nextStep);
+    syncUrlHash(nextStep, isAuthSwitch);
+    scrollToTop();
+  };
+
+  const handleAuthSuccess = () => {
+    const target = postLoginStep || 'home';
+    setAuthNotice('');
+    setPostLoginStep('home');
+    setDirection('forward');
+    setStep(target);
+    syncUrlHash(target, true);
+    scrollToTop();
+  };
+
+  const handleSaveDetailToPlanner = (item, type) => {
+    const normalized = normalizeDetailToPlannerItem(item, type);
+    if (!normalized) return;
+    setPlannerPendingItem(normalized);
+    goTo('meal-planner', 'forward');
   };
 
   const handleAyoLanjutkan = () => {
@@ -740,6 +1028,12 @@ export default function App() {
       goTo('home', 'backward');
     } else if (step === 'home') {
       goTo('welcome', 'backward');
+    } else if (step === 'meal-planner') {
+      setPlannerPendingItem(null);
+      goTo(plannerReturnStep || 'home', 'backward');
+    } else if (step === 'login' || step === 'register') {
+      setAuthNotice('');
+      goTo(authReturnStep || 'welcome', 'backward');
     }
   };
 
@@ -1051,6 +1345,33 @@ export default function App() {
 
   const chips = [10000, 20000, 30000, 50000, 100000];
 
+  const isWaitingProtectedAuth =
+    (isAuthConfigured && PROTECTED_STEPS.has(step) && (authLoading || !user)) ||
+    (!authLoading && Boolean(user) && (step === 'login' || step === 'register'));
+
+  if (isWaitingProtectedAuth) {
+    return (
+      <div className="wrapper">
+        <div className="phone">
+          <div className="screen">
+            <div className="auth-gate-loading" role="status" aria-live="polite">
+              <div className="auth-mascot-wrap">
+                <img
+                  src="/images/mascot/maskot_idle_1_breathing_blink.svg"
+                  alt="Maskot MAMI"
+                  className="auth-mascot-img"
+                  draggable={false}
+                />
+              </div>
+              <span className="auth-spinner auth-spinner--pink" aria-hidden="true" />
+              <p className="auth-gate-loading-text">Memuat halaman MAMI...</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="wrapper">
       <div className="phone">
@@ -1061,18 +1382,21 @@ export default function App() {
           {step === 'welcome' && (
             <div className={`step-container welcome-step ${direction}`} key="step-welcome">
               {/* Top-Left Brand Header */}
-              <header className="welcome-header">
-                <div className="welcome-logo-wrap">
-                  <img
-                    src="/images/mascot/maskot_idle_1_breathing_blink.svg"
-                    alt="Logo MAMI"
-                    className="welcome-logo-img"
-                  />
+              <header className="welcome-header auth-welcome-header">
+                <div className="auth-header-brand">
+                  <div className="welcome-logo-wrap">
+                    <img
+                      src="/images/mascot/maskot_idle_1_breathing_blink.svg"
+                      alt="Logo MAMI"
+                      className="welcome-logo-img"
+                    />
+                  </div>
+                  <div className="welcome-brand-text">
+                    <h1 className="welcome-brand-title">MAMI</h1>
+                    <p className="welcome-brand-sub">Makan &amp; Money Intelligence</p>
+                  </div>
                 </div>
-                <div className="welcome-brand-text">
-                  <h1 className="welcome-brand-title">MAMI</h1>
-                  <p className="welcome-brand-sub">Makan &amp; Money Intelligence</p>
-                </div>
+                <AuthHeaderAction onOpenLogin={() => goTo('login', 'forward')} />
               </header>
 
               {/* Main Rounded Card Container */}
@@ -1189,16 +1513,41 @@ export default function App() {
                     <p className="brand-sub">Makan &amp; Money Intelligence</p>
                   </div>
                 </div>
+                <div className="auth-brand-actions">
+                  <AuthHeaderAction compact onOpenLogin={() => goTo('login', 'forward')} />
+                  <button
+                    type="button"
+                    className="btn-nav-back"
+                    onClick={() => goTo('welcome', 'backward')}
+                    aria-label="Kembali ke Beranda"
+                  >
+                    <ArrowLeft size={15} strokeWidth={2.5} />
+                    <span>Beranda</span>
+                  </button>
+                </div>
+              </header>
+
+              <nav className="planner-mode-switcher" aria-label="Pindah mode perencanaan">
                 <button
                   type="button"
-                  className="btn-nav-back"
-                  onClick={() => goTo('welcome', 'backward')}
-                  aria-label="Kembali ke Beranda"
+                  className="planner-switcher-btn is-active"
+                  aria-current="page"
                 >
-                  <ArrowLeft size={15} strokeWidth={2.5} />
-                  <span>Beranda</span>
+                  <Utensils size={15} strokeWidth={2.4} />
+                  <span>Cari Makan Hari Ini</span>
                 </button>
-              </header>
+                <button
+                  type="button"
+                  className="planner-switcher-btn"
+                  onClick={() => goTo('meal-planner', 'forward')}
+                >
+                  <CalendarDays size={15} strokeWidth={2.4} />
+                  <span>Meal Planner 7 Hari</span>
+                  <span className="planner-switcher-badge">
+                    {savedPlannerSlots > 0 ? `${savedPlannerSlots}/21` : 'Baru'}
+                  </span>
+                </button>
+              </nav>
 
               {/* Greeting Card */}
               <section className="hero-card">
@@ -1947,6 +2296,15 @@ export default function App() {
                     </span>
                     <span className="bottom-bar-count">
                       {nutriSummary.totalKalori} kkal · {formatRupiah(nutriSummary.totalHarga)}
+                      <span
+                        className={`planner-sisa-pill ${
+                          budget >= nutriSummary.totalHarga ? 'is-safe' : 'is-over'
+                        }`}
+                      >
+                        {budget >= nutriSummary.totalHarga
+                          ? `Sisa ${formatRupiah(budget - nutriSummary.totalHarga)}`
+                          : `Lewat ${formatRupiah(nutriSummary.totalHarga - budget)}`}
+                      </span>
                     </span>
                   </div>
                   <button
@@ -2037,6 +2395,14 @@ export default function App() {
                         <span>Centang Semua Bahan Resep Ini</span>
                       </button>
                     )}
+                    <button
+                      type="button"
+                      className="planner-detail-save-btn"
+                      onClick={() => handleSaveDetailToPlanner(selectedDetail.data, 'resep')}
+                    >
+                      <CalendarDays size={13} strokeWidth={2.5} />
+                      <span>+ Simpan ke Meal Plan</span>
+                    </button>
                   </div>
 
                   {/* Quick Stats Grid */}
@@ -2158,6 +2524,14 @@ export default function App() {
                           : 'Sesuai budget'}
                       </span>
                     </div>
+                    <button
+                      type="button"
+                      className="planner-detail-save-btn"
+                      onClick={() => handleSaveDetailToPlanner(selectedDetail.data, 'menu')}
+                    >
+                      <CalendarDays size={13} strokeWidth={2.5} />
+                      <span>+ Simpan ke Meal Plan</span>
+                    </button>
                   </div>
 
                   {/* Quick Stats Grid */}
@@ -2607,6 +2981,43 @@ export default function App() {
                   </button>
                 </div>
               </div>
+            </div>
+          )}
+
+          {step === 'login' && (
+            <div className={`step-container ${direction}`} key="step-login">
+              <LoginScreen
+                onBack={handleBack}
+                onSuccess={handleAuthSuccess}
+                onSwitchToRegister={() => goTo('register', 'forward')}
+                redirectMessage={authNotice}
+              />
+            </div>
+          )}
+
+          {step === 'register' && (
+            <div className={`step-container ${direction}`} key="step-register">
+              <RegisterScreen
+                onBack={handleBack}
+                onSuccess={handleAuthSuccess}
+                onSwitchToLogin={() => goTo('login', 'backward')}
+              />
+            </div>
+          )}
+
+          {step === 'meal-planner' && (
+            <div className={`step-container ${direction}`} key="step-meal-planner">
+              <MealPlannerScreen
+                onBack={handleBack}
+                onSwitchToHome={() => {
+                  setPlannerPendingItem(null);
+                  goTo('home', 'backward');
+                }}
+                user={user}
+                storageUserId={plannerStorageId}
+                pendingItem={plannerPendingItem}
+                onClearPendingItem={() => setPlannerPendingItem(null)}
+              />
             </div>
           )}
         </div>
